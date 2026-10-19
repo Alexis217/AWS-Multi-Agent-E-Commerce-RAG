@@ -163,48 +163,95 @@ def _read_workflow_state(session_id: str) -> Optional[dict]:
 trace = AgentTrace(read_state_fn=_read_workflow_state)
 
 
-def _update_workflow_state(session_id: str, updates: dict,
-                           expected_version: int, max_retries: int = 3) -> dict:
+def _update_workflow_state(
+    session_id: str,
+    updates: dict,
+    expected_version: int,
+    max_retries: int = 3,
+) -> dict:
     """
     Update WorkflowState with optimistic locking.
-    """
-    from boto3.dynamodb.conditions import Attr
 
+    The first attempt uses the version read before the worker call.
+    If another operation changes the record concurrently, retry using
+    the latest version. Only the specified fields are updated.
+    """
     table = dynamodb.Table(config.WORKFLOW_STATE_TABLE)
+    version = int(expected_version)
 
     for attempt in range(max_retries):
         try:
-            update_expr_parts = [f"{k} = :{k}" for k in updates]
-            update_expr_parts.append("version = :new_version")
+            update_expr_parts = [
+                f"#{key} = :{key}" for key in updates
+            ]
+            update_expr_parts.append("#version = :new_version")
             update_expr = "SET " + ", ".join(update_expr_parts)
 
-            expr_values = {f":{k}": v for k, v in updates.items()}
-            expr_values[':new_version']      = expected_version + 1
-            expr_values[':expected_version'] = expected_version
+            expr_names = {
+                f"#{key}": key for key in updates
+            }
+            expr_names["#version"] = "version"
+
+            expr_values = {
+                f":{key}": value
+                for key, value in updates.items()
+            }
+            expr_values[":new_version"] = version + 1
+            expr_values[":expected_version"] = version
 
             table.update_item(
-                Key={'session_id': session_id},
+                Key={"session_id": session_id},
                 UpdateExpression=update_expr,
-                ConditionExpression='version = :expected_version',
-                ExpressionAttributeValues=expr_values
+                ConditionExpression="#version = :expected_version",
+                ExpressionAttributeNames=expr_names,
+                ExpressionAttributeValues=expr_values,
             )
-            return _read_workflow_state(session_id)
 
-        except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+            updated_state = _read_workflow_state(session_id)
+
+            if not updated_state:
+                raise RuntimeError(
+                    f"WorkflowState disappeared after update "
+                    f"(session: {session_id})."
+                )
+
+            if int(updated_state["version"]) != version + 1:
+                raise RuntimeError(
+                    f"Unexpected WorkflowState version after update "
+                    f"(session: {session_id})."
+                )
+
+            return updated_state
+
+        except (
+            dynamodb.meta.client.exceptions.ConditionalCheckFailedException
+        ):
             if attempt == max_retries - 1:
                 raise RuntimeError(
-                    f"WorkflowState update failed after {max_retries} retries "
-                    f"(session: {session_id}). Too many concurrent writes."
+                    f"WorkflowState update failed after {max_retries} "
+                    f"attempts (session: {session_id}). "
+                    "Too many concurrent writes."
                 )
+
             logger.warning(
-                f"WorkflowState version conflict on attempt {attempt+1}, retrying..."
+                "WorkflowState version conflict on attempt %s; retrying.",
+                attempt + 1,
             )
+
             current = _read_workflow_state(session_id)
-            if current:
-                expected_version = int(current['version'])
+
+            if not current:
+                raise RuntimeError(
+                    f"WorkflowState not found during retry "
+                    f"(session: {session_id})."
+                )
+
+            version = int(current["version"])
             time.sleep(0.1 * (attempt + 1))
 
-    raise RuntimeError("WorkflowState update: unexpected exit from retry loop")
+    raise RuntimeError(
+        "WorkflowState update: unexpected exit from retry loop."
+    )
 
 
 # ═══════════════════════════════════════════════════════
@@ -464,7 +511,7 @@ def build_policy_agent() -> Agent:
     returns_retriever = Agent(
         model=BedrockModel(
             model_id=config.WORKER_MODEL_ID,
-            temperature=0.2,
+            temperature=0.0,
         ),
         system_prompt=retriever_prompt + " You specialize in returns policies.",
         tools=[returns_tool],
@@ -473,7 +520,7 @@ def build_policy_agent() -> Agent:
     shipping_retriever = Agent(
         model=BedrockModel(
             model_id=config.WORKER_MODEL_ID,
-            temperature=0.2,
+            temperature=0.0,
         ),
         system_prompt=retriever_prompt + " You specialize in shipping policies.",
         tools=[shipping_tool],
@@ -482,7 +529,7 @@ def build_policy_agent() -> Agent:
     warranty_retriever = Agent(
         model=BedrockModel(
             model_id=config.WORKER_MODEL_ID,
-            temperature=0.2,
+            temperature=0.0,
         ),
         system_prompt=retriever_prompt + " You specialize in warranty policies.",
         tools=[warranty_tool],
@@ -600,7 +647,7 @@ def build_orchestrator_agent(
     policy_agent: Agent,
     communication_agent: Agent,
 ) -> Agent:
-    """Build the router that coordinates the worker agents and shared state."""
+    """Build the router that coordinates workers and shared WorkflowState."""
 
     model = BedrockModel(
         model_id=config.ORCHESTRATOR_MODEL_ID,
@@ -612,18 +659,23 @@ def build_orchestrator_agent(
         """Initialize WorkflowState before handling every request."""
         try:
             existing = _read_workflow_state(session_id)
+
             if existing:
-                # The session may be reused for multiple chat turns.
-                # Preserve accumulated context rather than overwriting it.
                 if existing.get("customer_id") != customer_id:
                     return (
                         "Error: this session belongs to a different customer. "
                         "Do not continue processing this request."
                     )
+
                 return f"Session {session_id} is initialized."
 
             _create_workflow_state(session_id, customer_id)
-            return f"Session {session_id} initialized for customer {customer_id}."
+
+            return (
+                f"Session {session_id} initialized "
+                f"for customer {customer_id}."
+            )
+
         except Exception as exc:
             logger.exception("Could not initialize workflow session")
             return f"Session initialization failed: {exc}"
@@ -634,42 +686,67 @@ def build_orchestrator_agent(
         customer_id: str,
         request: str,
     ) -> str:
-        """Gather order or account facts, then store the InventoryAgent result."""
+        """Read context, call InventoryAgent, and persist its findings."""
+
+        # Read state and version BEFORE calling the worker.
+        state = _read_workflow_state(session_id)
+
+        if not state:
+            return "Error: workflow session was not initialized."
+
+        expected_version = int(state["version"])
+
         prompt = (
             f"Session ID: {session_id}\n"
             f"Customer ID: {customer_id}\n"
             f"Customer request: {request}\n"
-            "Use the appropriate inventory tools to retrieve facts only."
+            f"Current WorkflowState: {json.dumps(state, default=str)}\n"
+            "Use the appropriate inventory tools to retrieve factual "
+            "information. Do not make refund decisions."
         )
+
         result = str(inventory_agent(prompt))
 
-        state = _read_workflow_state(session_id)
-        if not state:
-            return "Error: workflow session was not initialized."
-
+        # Persist using the version captured before the worker call.
         _update_workflow_state(
             session_id,
             {"inventory_agent": result},
-            int(state.get("version", 0)),
+            expected_version=expected_version,
         )
+
         return result
 
     @tool
-    def route_to_policy_agent(session_id: str, request: str) -> str:
-        """Retrieve policy evidence and store the PolicyAgent result."""
-        result = str(policy_agent(
-            f"Session ID: {session_id}\nPolicy question: {request}"
-        ))
+    def route_to_policy_agent(
+        session_id: str,
+        request: str,
+    ) -> str:
+        """Read context, call PolicyAgent, and persist policy findings."""
 
+        # Read state and version BEFORE calling the worker.
         state = _read_workflow_state(session_id)
+
         if not state:
             return "Error: workflow session was not initialized."
+
+        expected_version = int(state["version"])
+
+        prompt = (
+            f"Session ID: {session_id}\n"
+            f"Policy question: {request}\n"
+            f"Current WorkflowState: {json.dumps(state, default=str)}\n"
+            "Retrieve relevant policy evidence from the configured "
+            "returns, shipping, and warranty knowledge bases."
+        )
+
+        result = str(policy_agent(prompt))
 
         _update_workflow_state(
             session_id,
             {"policy_agent": result},
-            int(state.get("version", 0)),
+            expected_version=expected_version,
         )
+
         return result
 
     @tool
@@ -678,32 +755,43 @@ def build_orchestrator_agent(
         customer_id: str,
         request: str,
     ) -> str:
-        """Evaluate return eligibility after inventory facts have been gathered."""
+        """Evaluate return eligibility using the current workflow context."""
+
+        # Read state and version BEFORE calling the worker.
         state = _read_workflow_state(session_id)
-        if not state or not state.get("inventory_agent"):
+
+        if not state:
+            return "Error: workflow session was not initialized."
+
+        inventory_facts = state.get("inventory_agent")
+
+        if not inventory_facts:
             return (
-                "Refund evaluation skipped: inventory facts must be retrieved "
-                "before the refund agent is called."
+                "Refund evaluation skipped: inventory facts must be "
+                "retrieved before the refund agent is called."
             )
+
+        expected_version = int(state["version"])
 
         prompt = (
             f"Session ID: {session_id}\n"
             f"Customer ID: {customer_id}\n"
             f"Customer request: {request}\n"
-            f"Inventory facts: {state.get('inventory_agent')}\n"
-            "Evaluate eligibility using the facts and applicable return window. "
-            "Do not initiate a return unless the order is verified and eligible."
+            f"Current WorkflowState: {json.dumps(state, default=str)}\n"
+            f"Inventory facts: {json.dumps(inventory_facts, default=str)}\n"
+            "Evaluate eligibility using the available facts and applicable "
+            "return window. Do not invent missing facts. Do not initiate "
+            "a return unless the order is verified and eligible."
         )
+
         result = str(refund_agent(prompt))
 
-        # Re-read after the worker runs, since its tools may have changed state.
-        latest = _read_workflow_state(session_id)
-        if latest:
-            _update_workflow_state(
-                session_id,
-                {"refund_agent": result},
-                int(latest.get("version", 0)),
-            )
+        _update_workflow_state(
+            session_id,
+            {"refund_agent": result},
+            expected_version=expected_version,
+        )
+
         return result
 
     @tool
@@ -713,20 +801,33 @@ def build_orchestrator_agent(
         original_request: str,
     ) -> str:
         """Compose and persist the final customer-facing response."""
-        result = str(communication_agent(
+
+        # Read state and version BEFORE calling the worker.
+        state = _read_workflow_state(session_id)
+
+        if not state:
+            return "Error: workflow session was not initialized."
+
+        expected_version = int(state["version"])
+
+        prompt = (
             f"Session ID: {session_id}\n"
             f"Customer ID: {customer_id}\n"
             f"Original customer request: {original_request}\n"
-            "Compose the final customer-facing reply from WorkflowState."
-        ))
+            f"Current WorkflowState: {json.dumps(state, default=str)}\n"
+            "Use get_full_workflow_context to verify the accumulated "
+            "findings, then compose the final customer-facing response. "
+            "Never invent missing information."
+        )
 
-        state = _read_workflow_state(session_id)
-        if state:
-            _update_workflow_state(
-                session_id,
-                {"communication_agent": result},
-                int(state.get("version", 0)),
-            )
+        result = str(communication_agent(prompt))
+
+        _update_workflow_state(
+            session_id,
+            {"communication_agent": result},
+            expected_version=expected_version,
+        )
+
         return result
 
     system_prompt = """
@@ -738,29 +839,32 @@ these routing rules in order.
 
 2. Order status, order history, return, or refund requests: call
    route_to_inventory_agent first. For return/refund requests, then call
-   route_to_refund_agent. Do not call the refund agent before inventory.
+   route_to_refund_agent. Never call the refund agent before inventory.
 
-3. Policy meaning questions about return windows, shipping, warranties, rates,
-   or terms: call route_to_policy_agent.
+3. Policy questions about return windows, shipping, warranties, rates, or
+   terms: call route_to_policy_agent. PolicyAgent searches returns, shipping,
+   and warranty knowledge bases in parallel.
 
-4. Account questions such as "what is my tier?" or "am I premium?": call
-   route_to_inventory_agent. NEVER use route_to_policy_agent for account data.
+4. Account questions such as "what is my tier?" or "am I premium?":
+   call route_to_inventory_agent. NEVER use route_to_policy_agent for
+   customer account data.
 
-5. Pure math/calculation questions: calculate directly. Do not call inventory,
-   policy, or refund agents for a standalone calculation.
+5. Pure math/calculation questions: calculate directly. Do not call
+   inventory, policy, or refund agents for a standalone calculation.
 
 6. EVERY request: route_to_communication_agent MUST be the final tool action,
    after all other required tools. It is mandatory even if you think you
    already know the answer.
 
-You are NEVER allowed to write the final customer-facing response yourself.
-Do not answer the customer directly, before or after tool use. The
+You are NEVER allowed to compose the final customer-facing response yourself.
 CommunicationAgent alone composes the final reply. Your final response must
 only pass through the result of route_to_communication_agent.
 
 For mixed requests, call all relevant worker agents according to the rules
-above, then call route_to_communication_agent last. Never invent session IDs
-or customer IDs; extract them from the supplied request metadata.
+above, then call route_to_communication_agent last.
+
+Never invent session IDs or customer IDs. Extract them from the supplied
+request metadata.
 """
 
     return Agent(

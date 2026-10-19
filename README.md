@@ -33,6 +33,8 @@ The system follows an **Orchestrator → Workers** architecture with five specia
 │   └── Tests.png
 ├── X_Ray_Service_Map/
 │   └── Service_Map.png
+│   └── Service_Map_Nodes.png
+│   └── Service_Map_Update.png
 ├── .env.example
 └── README.md
 ```
@@ -59,4 +61,5 @@ The system follows an **Orchestrator → Workers** architecture with five specia
 
 ### AWS X-Ray Service Map
 
-![Service Map](X_Ray_Service_Map/Service_Map.png)
+![Service Map](X_Ray_Service_Map/Service_Map_Update.png)
+![Service Map](X_Ray_Service_Map/Service_Map_Nodes.png)
